@@ -1,0 +1,32 @@
+{
+	"name": "pi-crw",
+	"version": "0.1.0",
+	"description": "web_search + web_scrape tools for the pi coding agent, backed by the crw web scraper. Zero-config, MIT, talks to crw over CLI/HTTP (no AGPL code bundled).",
+	"type": "module",
+	"license": "MIT",
+	"author": "us",
+	"keywords": ["pi", "pi-agent", "coding-agent", "web-search", "web-scrape", "crw", "extension", "ai-tools"],
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/us/pi-crw.git"
+	},
+	"engines": {
+		"node": ">=20"
+	},
+	"bin": {
+		"pi-crw": "bin/pi-crw.mjs"
+	},
+	"files": ["src/crw.ts", "bin/pi-crw.mjs", "README.md", "LICENSE"],
+	"scripts": {
+		"typecheck": "tsc --noEmit",
+		"test": "node tests/run.mjs && node tests/robustness.mjs",
+		"test:all": "node tests/run.mjs && node tests/robustness.mjs && node tests/no-backend-real.mjs",
+		"prepublishOnly": "bun run typecheck"
+	},
+	"devDependencies": {
+		"@sinclair/typebox": "^0.34.0",
+		"@types/node": "^22.0.0",
+		"jiti": "^2.0.0",
+		"typescript": "^5.6.0"
+	}
+}
