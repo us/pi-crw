@@ -11,7 +11,7 @@ instead of curl.
 ## Install
 
 ```bash
-npx pi-crw install      # or: bunx pi-crw install
+npx github:us/pi-crw install      # or: bunx github:us/pi-crw install
 ```
 
 That copies the extension into pi's extensions dir
@@ -19,9 +19,13 @@ That copies the extension into pi's extensions dir
 `web_search` and `web_scrape`. No config needed.
 
 ```bash
-pi-crw status           # is it installed? which backend?
-pi-crw uninstall        # remove it
+npx github:us/pi-crw status       # is it installed? which backend?
+npx github:us/pi-crw uninstall    # remove it
 ```
+
+> Installed straight from the GitHub repo (no npm registry). For a pinned
+> version use `npx github:us/pi-crw#v0.1.0 install`, or clone and run
+> `node bin/pi-crw.mjs install`.
 
 ## Backends (auto-detected, zero-config)
 
