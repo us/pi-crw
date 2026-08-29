@@ -12,6 +12,7 @@
  *
  * Target dir override: PI_CRW_TARGET (defaults to ~/.pi/agent/extensions).
  */
+import { spawnSync } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -22,10 +23,20 @@ const SOURCE = join(HERE, "..", "src", "crw.ts");
 const TARGET_DIR = process.env.PI_CRW_TARGET || join(homedir(), ".pi", "agent", "extensions");
 const TARGET = join(TARGET_DIR, "crw.ts");
 
+const CLOUD_API_URL = "https://api.fastcrw.com";
+
+// Mirrors resolveBackend() in src/crw.ts. Keep the two in step.
 function backendHint() {
+	if (process.env.PI_OFFLINE) return "disabled (PI_OFFLINE is set)";
 	if (process.env.CRW_API_URL) return `HTTP -> ${process.env.CRW_API_URL}`;
+	if (process.env.CRW_API_KEY) return `HTTP -> ${CLOUD_API_URL} (CRW_API_KEY)`;
 	if (process.env.CRW_BIN) return `CLI -> ${process.env.CRW_BIN} (CRW_BIN)`;
-	return "CLI -> `crw` on PATH (set CRW_API_URL or CRW_BIN to override)";
+	if (whichCrw()) return "CLI -> `crw` on PATH";
+	return `HTTP -> ${CLOUD_API_URL} (no CRW_API_KEY yet: get a free one at https://fastcrw.com)`;
+}
+
+function whichCrw() {
+	return spawnSync("crw", ["--version"], { stdio: "ignore" }).status === 0;
 }
 
 const cmd = process.argv[2] || "help";
@@ -39,7 +50,7 @@ if (cmd === "install") {
 	copyFileSync(SOURCE, TARGET);
 	console.log(`pi-crw installed -> ${TARGET}`);
 	console.log(`backend: ${backendHint()}`);
-	console.log("Open a new pi session; the agent will have web_search + web_scrape.");
+	console.log("Open a new pi session; the agent will have web_search + web_scrape + web_map.");
 } else if (cmd === "uninstall") {
 	if (existsSync(TARGET)) {
 		rmSync(TARGET);
@@ -59,9 +70,14 @@ if (cmd === "install") {
   uninstall   remove it
   status      show install state + selected backend
 
-Backends (auto-detected at pi startup):
-  CRW_API_URL set  -> HTTP (fastcrw.com cloud or a local 'crw serve')
-  otherwise        -> CLI  (the 'crw' binary on PATH, or CRW_BIN)
+Backends (auto-detected at pi startup, first hit wins):
+  CRW_API_URL set  -> HTTP against that base (your own 'crw serve')
+  CRW_API_KEY set  -> HTTP against the managed API (${CLOUD_API_URL})
+  'crw' on PATH    -> CLI (or CRW_BIN)
+  nothing local    -> HTTP against the managed API, keyless; the first call
+                      tells you to set CRW_API_KEY
+
+  PI_OFFLINE=1 disables the extension entirely.
 
 This package bundles NO crw source. It only speaks to crw over its
 stable CLI/HTTP protocol, so this MIT package and AGPL crw stay separate.`);

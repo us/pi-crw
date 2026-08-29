@@ -1,11 +1,11 @@
 {
 	"name": "pi-crw",
 	"version": "0.1.0",
-	"description": "web_search + web_scrape tools for the pi coding agent, backed by the crw web scraper. Zero-config, MIT, talks to crw over CLI/HTTP (no AGPL code bundled).",
+	"description": "web_search + web_scrape + web_map tools for the pi coding agent, backed by the crw web scraper. Zero-config, MIT, talks to crw over CLI/HTTP (no AGPL code bundled).",
 	"type": "module",
 	"license": "MIT",
 	"author": "us",
-	"keywords": ["pi", "pi-agent", "coding-agent", "web-search", "web-scrape", "crw", "extension", "ai-tools"],
+	"keywords": ["pi", "pi-agent", "coding-agent", "web-search", "web-scrape", "sitemap", "crw", "extension", "ai-tools"],
 	"repository": {
 		"type": "git",
 		"url": "git+https://github.com/us/pi-crw.git"

@@ -27,9 +27,11 @@ async function loadExtFresh() {
 	return pi;
 }
 function cliEnv(extra = {}) {
-	delete process.env.CRW_API_URL;
+	// CRW_API_KEY must go too: with the cloud default it now outranks the
+	// binary, so a developer with the key exported would test HTTP by accident.
+	for (const k of ["CRW_API_URL", "CRW_API_KEY", "PI_OFFLINE", "MOCK_MODE", "ARGS_FILE", "CRW_TIMEOUT_MS"])
+		delete process.env[k];
 	process.env.CRW_BIN = MOCK;
-	for (const k of ["MOCK_MODE", "ARGS_FILE", "CRW_TIMEOUT_MS"]) delete process.env[k];
 	Object.assign(process.env, extra);
 }
 
@@ -120,6 +122,22 @@ console.log("\n[CLI] --js arg passthrough  &  L2 limit clamp");
 	pi = await loadExtFresh();
 	await pi.tools.get("web_search").execute("j3", { query: "x", limit: 9999 }, undefined);
 	ok(/-l 50\b/.test(readFileSync(ARGS_FILE, "utf8")), "large finite limit clamped to MAX_SEARCH_LIMIT 50");
+
+	rmSync(ARGS_FILE);
+	pi = await loadExtFresh();
+	await pi.tools.get("web_search").execute("j4", { query: "x", category: "github" }, undefined);
+	ok(/--category github/.test(readFileSync(ARGS_FILE, "utf8")), "search category -> '--category github' in argv");
+
+	rmSync(ARGS_FILE);
+	pi = await loadExtFresh();
+	await pi.tools.get("web_scrape").execute("j5", { url: "https://x", format: "text" }, undefined);
+	ok(/-f text/.test(readFileSync(ARGS_FILE, "utf8")), "M7 CLI format=text asks the binary for text, not json");
+
+	rmSync(ARGS_FILE);
+	pi = await loadExtFresh();
+	await pi.tools.get("web_map").execute("j6", { url: "https://x", limit: 7 }, undefined);
+	const aMap = readFileSync(ARGS_FILE, "utf8");
+	ok(/^map https:\/\/x -f json --limit 7/.test(aMap.trim()), `map argv (${aMap.trim()})`);
 	rmSync(ARGS_FILE);
 }
 
@@ -193,6 +211,86 @@ console.log("\n[HTTP] mock crw serve: M4 links, M5 {success:false}, non-2xx, M2 
 		ok(false, "should have rejected on HTTP abort");
 	} catch (e) {
 		ok(e.name === "AbortError", `M2 HTTP abort preserves AbortError (name=${e.name})`);
+	}
+
+	await new Promise((r) => server.close(r));
+	delete process.env.CRW_API_URL;
+}
+
+console.log("\n[HTTP] wire format: M6 auth hint, M7 plainText, M8 renderJs, M9 categories");
+{
+	const seen = [];
+	const server = createServer((req, res) => {
+		let body = "";
+		req.on("data", (c) => (body += c));
+		req.on("end", () => {
+			const j = body ? JSON.parse(body) : {};
+			seen.push({ path: req.url, body: j });
+			res.setHeader("content-type", "application/json");
+			if (req.url === "/v1/scrape" && j.url === "https://denied") {
+				res.statusCode = 401;
+				res.end('{"error":"Invalid or missing API key"}');
+			} else if (req.url === "/v1/scrape" && j.url === "https://broke") {
+				res.statusCode = 402;
+				res.end('{"error":"Insufficient credits. Top up at https://fastcrw.com/dashboard"}');
+			} else if (req.url === "/v1/scrape") {
+				res.end(
+					JSON.stringify({
+						success: true,
+						data: { markdown: "# md", plainText: "flat plain text", links: ["https://a"] },
+					}),
+				);
+			} else if (req.url === "/v1/search") {
+				res.end(JSON.stringify({ success: true, data: [{ url: "https://x", snippet: "from snippet" }] }));
+			} else if (req.url === "/v1/map") {
+				res.end(JSON.stringify({ success: true, data: { links: ["https://x/a", "https://x/b", "https://x/c"] } }));
+			} else {
+				res.statusCode = 404;
+				res.end("{}");
+			}
+		});
+	});
+	await new Promise((r) => server.listen(0, "127.0.0.1", r));
+	const port = server.address().port;
+	for (const k of ["CRW_BIN", "CRW_API_KEY", "PI_OFFLINE"]) delete process.env[k];
+	process.env.CRW_API_URL = `http://127.0.0.1:${port}`;
+	const pi = await loadExtFresh();
+	const last = () => seen[seen.length - 1].body;
+
+	await pi.tools.get("web_scrape").execute("w1", { url: "https://x", js: true }, undefined);
+	ok(last().renderJs === true, `M8 js:true -> body.renderJs (body: ${JSON.stringify(last())})`);
+	ok(!("js" in last()), "M8 the dead 'js' field is no longer sent");
+
+	const tr = await pi.tools.get("web_scrape").execute("w2", { url: "https://x", format: "text" }, undefined);
+	ok(JSON.stringify(last().formats) === '["plainText"]', `M7 format=text -> formats ["plainText"] (${JSON.stringify(last().formats)})`);
+	ok(tr.content[0].text === "flat plain text", "M7 plainText is read back, not silently swapped for markdown");
+
+	await pi.tools.get("web_search").execute("w3", { query: "q", category: "github" }, undefined);
+	ok(JSON.stringify(last().categories) === '["github"]', `M9 category -> categories:["github"] (${JSON.stringify(last().categories)})`);
+	ok(!("category" in last()), "M9 the singular 'category' field is no longer sent");
+
+	const sq = await pi.tools.get("web_search").execute("w4", { query: "q" }, undefined);
+	ok(/from snippet/.test(sq.content[0].text), "search falls back to the 'snippet' alias when description is absent");
+
+	const mr = await pi.tools.get("web_map").execute("w5", { url: "https://x", limit: 2 }, undefined);
+	ok(last().limit === 2, `map forwards limit (${last().limit})`);
+	ok(mr.details.links.length === 2, "map trims an over-long server response to the requested limit");
+
+	try {
+		await pi.tools.get("web_scrape").execute("w6", { url: "https://denied" }, undefined);
+		ok(false, "M6 should have thrown on 401");
+	} catch (e) {
+		ok(/CRW_API_KEY/.test(e.message) && /fastcrw\.com/.test(e.message), `M6 401 is actionable (${e.message})`);
+	}
+
+	try {
+		await pi.tools.get("web_scrape").execute("w7", { url: "https://broke" }, undefined);
+		ok(false, "should have thrown on 402");
+	} catch (e) {
+		ok(
+			/Insufficient credits/.test(e.message) && !/set CRW_API_KEY/.test(e.message),
+			`M6 402 keeps the server's own credit copy, no bogus key advice (${e.message})`,
+		);
 	}
 
 	await new Promise((r) => server.close(r));

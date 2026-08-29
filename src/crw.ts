@@ -1,26 +1,31 @@
 /**
  * crw web tools extension for pi
  *
- * Gives the pi coding agent first-class `web_search` and `web_scrape` tools
- * backed by the crw web scraper. pi has no native web capability, so without
- * this the agent can only reach the web by shelling out via curl.
+ * Gives the pi coding agent first-class `web_search`, `web_scrape` and
+ * `web_map` tools backed by the crw web scraper. pi has no native web
+ * capability, so without this the agent can only reach the web by shelling out
+ * via curl.
  *
  * This file contains NO crw source code. It only invokes a separately
  * distributed crw binary (subprocess) or a crw HTTP endpoint. That arms-length
  * boundary is deliberate: crw is AGPL-3.0, this extension is MIT, and they are
  * never linked or bundled — only spoken to over a stable CLI/HTTP protocol.
  *
- * Backend is selected from the environment:
- *   - CRW_API_URL set        -> HTTP mode  (POST {url}/v1/scrape | /v1/search,
- *                               Authorization: Bearer CRW_API_KEY when present).
- *                               Covers fastcrw.com cloud and a local `crw serve`.
- *   - otherwise              -> embedded CLI mode (spawns the `crw` binary,
- *                               self-contained, zero config).
+ * Backend is selected from the environment, first hit wins:
+ *   1. CRW_API_URL set   -> HTTP against that base (self-hosted `crw serve`,
+ *                           or the cloud spelled out explicitly).
+ *   2. CRW_API_KEY set   -> HTTP against the cloud (api.fastcrw.com). A key
+ *                           with no URL can only mean the managed API, and the
+ *                           cloud is strictly more capable than a bare local
+ *                           binary (its search backend is already provisioned).
+ *   3. `crw` on PATH     -> CLI mode (CRW_BIN overrides the binary).
+ *   4. nothing local     -> HTTP against the cloud anyway, keyless. The tools
+ *                           still register and the first call returns an
+ *                           actionable "set CRW_API_KEY" message, which beats
+ *                           an agent that silently has no web access.
  *
- * Binary resolution for CLI mode (first hit wins): CRW_BIN -> `crw` on PATH.
- *
- * If no backend can be resolved the tools are NOT registered, so pi keeps
- * working exactly as before (mirrors the fd/rg PI_OFFLINE philosophy).
+ * PI_OFFLINE disables the extension entirely (mirrors pi's own fd/rg
+ * convention), so an air-gapped session registers nothing.
  *
  * Tunables: CRW_TIMEOUT_MS (default 60000), CRW_BIN, CRW_API_URL, CRW_API_KEY.
  */
@@ -30,6 +35,12 @@ import { existsSync } from "node:fs";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
+/** Managed crw API. Matches the official SDKs' `CLOUD_API_URL`. */
+const CLOUD_API_URL = "https://api.fastcrw.com";
+const SIGNUP_HINT =
+	"set CRW_API_KEY (free key, 1000 credits, no card: https://fastcrw.com) " +
+	"or point CRW_API_URL at your own `crw serve`";
+
 const TIMEOUT_MS = (() => {
 	// L1: a negative/NaN CRW_TIMEOUT_MS must not bypass the default (a value
 	// like -5 is truthy and would make setTimeout fire immediately).
@@ -38,6 +49,7 @@ const TIMEOUT_MS = (() => {
 })();
 const MAX_STDOUT_BYTES = 5 * 1024 * 1024; // 5 MB cap, then truncate
 const MAX_SEARCH_LIMIT = 50; // L2: clamp so limit=Infinity can't reach the backend
+const MAX_MAP_LIMIT = 5000; // a coding agent reads a list, it does not dump a sitemap
 
 /** A cancellation error that preserves abort identity for callers (M2). */
 function abortError(): Error {
@@ -50,10 +62,12 @@ type Backend = { kind: "http"; url: string; key?: string } | { kind: "cli"; bin:
 
 /** Resolve the crw backend once, synchronously, at load time. */
 function resolveBackend(): Backend | null {
+	if (process.env.PI_OFFLINE) return null;
+
+	const key = process.env.CRW_API_KEY?.trim() || undefined;
 	const apiUrl = process.env.CRW_API_URL?.trim();
-	if (apiUrl) {
-		return { kind: "http", url: apiUrl.replace(/\/+$/, ""), key: process.env.CRW_API_KEY?.trim() || undefined };
-	}
+	if (apiUrl) return { kind: "http", url: apiUrl.replace(/\/+$/, ""), key };
+	if (key) return { kind: "http", url: CLOUD_API_URL, key };
 
 	const candidates = [process.env.CRW_BIN?.trim(), "crw"].filter((c): c is string => !!c && c.length > 0);
 	for (const bin of candidates) {
@@ -65,7 +79,9 @@ function resolveBackend(): Backend | null {
 		const probe = spawnSync(bin, ["--version"], { stdio: "ignore" });
 		if (!probe.error && probe.status === 0) return { kind: "cli", bin };
 	}
-	return null;
+
+	// No key, no binary: default to the cloud rather than leaving pi web-less.
+	return { kind: "http", url: CLOUD_API_URL };
 }
 
 /** Spawn the crw binary, honoring the abort signal, timeout, and a stdout cap. */
@@ -160,6 +176,15 @@ async function httpCall(
 	}
 	if (!res.ok) {
 		const text = await res.text().catch(() => "");
+		// M6: an auth rejection is the one failure the user can fix from the
+		// shell, and it is the expected first response for the keyless cloud
+		// default. Say what to do instead of leaking a bare status. 402 is
+		// deliberately NOT here: the managed API uses it for exhausted credits
+		// and declined cards, whose own body already carries the right copy,
+		// and "set CRW_API_KEY" would be wrong advice for a caller who has one.
+		if (res.status === 401 || res.status === 403) {
+			throw new Error(`crw ${path} -> HTTP ${res.status}: ${SIGNUP_HINT}${text ? ` (${text.slice(0, 200)})` : ""}`);
+		}
 		throw new Error(`crw ${path} -> HTTP ${res.status}${text ? `: ${text.slice(0, 500)}` : ""}`);
 	}
 	let json: unknown;
@@ -168,9 +193,9 @@ async function httpCall(
 	} catch (e) {
 		throw new Error(`crw ${path}: response was not valid JSON: ${(e as Error).message}`);
 	}
-	// M5: a Firecrawl-compatible server can return HTTP 200 with
-	// { success: false, error }. Without this the error is silently dropped
-	// and the caller only sees a confusing "empty result".
+	// M5: crw answers HTTP 200 with { success: false, error } when the page
+	// itself failed (anti-bot wall, upstream error page). Without this the
+	// error is silently dropped and the caller only sees an empty result.
 	if (json && typeof json === "object" && !Array.isArray(json)) {
 		const j = json as Record<string, unknown>;
 		if (j.success === false) {
@@ -199,10 +224,14 @@ interface ScrapeNorm {
 function normalizeScrape(raw: unknown): ScrapeNorm {
 	const obj = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
 	const d = (obj.data && typeof obj.data === "object" ? obj.data : obj) as Record<string, unknown>;
+	// M7: the engine's plain-text field is `plainText` (ScrapeData.plain_text).
+	// Reading only `text` meant `format=text` never found anything and always
+	// fell through to markdown. `text` stays in the chain for older servers.
+	const plain = typeof d.plainText === "string" ? d.plainText : typeof d.text === "string" ? d.text : undefined;
 	return {
 		markdown: typeof d.markdown === "string" ? d.markdown : undefined,
 		html: typeof d.html === "string" ? d.html : undefined,
-		text: typeof d.text === "string" ? d.text : undefined,
+		text: plain,
 		links: Array.isArray(d.links) ? (d.links as string[]) : undefined,
 		metadata: d.metadata && typeof d.metadata === "object" ? (d.metadata as Record<string, unknown>) : undefined,
 		creditCost: typeof d.creditCost === "number" ? d.creditCost : undefined,
@@ -228,10 +257,22 @@ function normalizeSearch(raw: unknown): SearchHit[] {
 		.map((h) => ({
 			url: String(h.url ?? ""),
 			title: typeof h.title === "string" ? h.title : undefined,
-			description: typeof h.description === "string" ? h.description : undefined,
+			description:
+				typeof h.description === "string"
+					? h.description
+					: typeof h.snippet === "string"
+						? h.snippet
+						: undefined,
 			position: typeof h.position === "number" ? h.position : undefined,
 		}))
 		.filter((h) => h.url.length > 0);
+}
+
+/** HTTP map wraps links in { success, data: { links } }; the CLI puts them at the top level. */
+function normalizeMap(raw: unknown): string[] {
+	const obj = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+	const d = (obj.data && typeof obj.data === "object" ? obj.data : obj) as Record<string, unknown>;
+	return Array.isArray(d.links) ? d.links.filter((l): l is string => typeof l === "string") : [];
 }
 
 function parseJson(text: string, what: string): unknown {
@@ -242,13 +283,19 @@ function parseJson(text: string, what: string): unknown {
 	}
 }
 
+/** Finite, positive, clamped. Guards against limit=Infinity reaching a backend (L2). */
+function clampLimit(raw: unknown, fallback: number, max: number): number {
+	const n = Number(raw);
+	return Number.isFinite(n) && n > 0 ? Math.min(Math.floor(n), max) : fallback;
+}
+
 const SCRAPE_FORMATS = ["markdown", "html", "text", "links", "json"] as const;
 
 export default function crwExtension(pi: ExtensionAPI) {
 	const backend = resolveBackend();
 	if (!backend) {
-		// No crw available: stay invisible so the agent is unaffected.
-		console.error("[crw] no backend resolved (set CRW_API_URL, CRW_BIN, or install `crw`); web tools disabled");
+		// PI_OFFLINE: stay invisible so the agent is unaffected.
+		console.error("[crw] PI_OFFLINE is set; web tools disabled");
 		return;
 	}
 
@@ -274,16 +321,15 @@ export default function crwExtension(pi: ExtensionAPI) {
 			const format = (params.format ?? "markdown") as (typeof SCRAPE_FORMATS)[number];
 			let norm: ScrapeNorm;
 			if (backend.kind === "http") {
-				// M4: ask the server for the format we actually need. The old
-				// code requested "markdown" for `links`, so norm.links was
-				// always empty and `format=links` threw "empty links". `text`
-				// has no Firecrawl equivalent, so it maps to markdown (the text
-				// branch below already falls back to it). `json` wants
-				// everything we expose.
+				// M4: ask the server for the format we actually need. Requesting
+				// "markdown" for `links` left norm.links empty and made
+				// `format=links` throw. `json` here is this tool's own bundle
+				// (content + links), not the engine's LLM-extraction `json`
+				// format, which needs a jsonSchema we do not take.
 				const fmtMap: Record<string, string[]> = {
 					markdown: ["markdown"],
 					html: ["html"],
-					text: ["markdown"],
+					text: ["plainText"],
 					links: ["links"],
 					json: ["markdown", "links"],
 				};
@@ -291,10 +337,19 @@ export default function crwExtension(pi: ExtensionAPI) {
 					url: params.url,
 					formats: fmtMap[format] ?? ["markdown"],
 				};
-				// L3: best-effort; servers that don't support it ignore it.
-				if (params.js) body.js = params.js;
+				// M8: the engine's field is `renderJs` (null = auto-detect).
+				// It was sent as `js`, which the engine does not read, so JS
+				// rendering was a silent no-op on the HTTP backend while the
+				// CLI backend honored the same parameter.
+				if (params.js) body.renderJs = true;
 				const raw = await httpCall(backend, "/v1/scrape", body, signal);
 				norm = normalizeScrape(raw);
+			} else if (format === "text") {
+				// The CLI's `-f json` bundle carries markdown/html/links but no
+				// plain text, so ask for it directly and take stdout verbatim.
+				const args = ["scrape", params.url, "-f", "text"];
+				if (params.js) args.push("--js");
+				norm = { text: await runCli(backend.bin, args, signal) };
 			} else {
 				const args = ["scrape", params.url, "-f", "json"];
 				if (params.js) args.push("--js");
@@ -324,20 +379,23 @@ export default function crwExtension(pi: ExtensionAPI) {
 			query: Type.String({ description: "Search query" }),
 			limit: Type.Optional(Type.Number({ description: "Max results (default: 5)" })),
 			category: Type.Optional(
-				Type.String({ description: "Search category, e.g. general | news | images | videos" }),
+				Type.String({
+					description:
+						"Narrow the search: 'github' for repos and code, 'research' for papers, 'pdf' for documents. Omit for a general web search.",
+				}),
 			),
 		}),
 		executionMode: "parallel",
 		async execute(_id, params, signal) {
-			// L2: a finite, clamped limit. Math.floor(Infinity) is Infinity,
-			// which would reach the backend as the literal string "Infinity".
-			const reqLimit = Number(params.limit);
-			const limit =
-				Number.isFinite(reqLimit) && reqLimit > 0 ? Math.min(Math.floor(reqLimit), MAX_SEARCH_LIMIT) : 5;
+			const limit = clampLimit(params.limit, 5, MAX_SEARCH_LIMIT);
 			let hits: SearchHit[];
 			if (backend.kind === "http") {
 				const body: Record<string, unknown> = { query: params.query, limit };
-				if (params.category) body.category = params.category;
+				// M9: the engine takes `categories` as a list. The singular
+				// string was an unknown field, so every category request
+				// silently ran as a plain web search. The CLI does the same
+				// wrapping internally for its own --category flag.
+				if (params.category) body.categories = [params.category];
 				hits = normalizeSearch(await httpCall(backend, "/v1/search", body, signal));
 			} else {
 				const args = ["search", params.query, "-l", String(limit), "-f", "json"];
@@ -359,7 +417,58 @@ export default function crwExtension(pi: ExtensionAPI) {
 		},
 	});
 
-	console.error(
-		`[crw] web_search + web_scrape registered (backend: ${backend.kind === "http" ? `http ${backend.url}` : `cli ${backend.bin}`})`,
-	);
+	pi.registerTool({
+		name: "web_map",
+		label: "Web Map",
+		description:
+			"List the URLs of a website (sitemap plus link discovery). Use it to find the page you actually need before scraping, instead of guessing paths.",
+		promptSnippet: "Discover the URLs a website exposes",
+		promptGuidelines: [
+			"Use web_map to locate the right page on a site (docs, changelog, API reference), then web_scrape that URL.",
+		],
+		parameters: Type.Object({
+			url: Type.String({ description: "Site or section URL to map, e.g. https://example.com/docs" }),
+			limit: Type.Optional(Type.Number({ description: "Max URLs to return (default: 100)" })),
+		}),
+		executionMode: "parallel",
+		async execute(_id, params, signal) {
+			const limit = clampLimit(params.limit, 100, MAX_MAP_LIMIT);
+			let links: string[];
+			if (backend.kind === "http") {
+				const raw = await httpCall(backend, "/v1/map", { url: params.url, limit }, signal);
+				links = normalizeMap(raw);
+			} else {
+				// `crw map --limit` is newer than the subcommand itself. Retry
+				// without it rather than hard-failing on an older binary: the
+				// slice below caps the result either way, we just do more work.
+				const args = ["map", params.url, "-f", "json", "--limit", String(limit)];
+				let out: string;
+				try {
+					out = await runCli(backend.bin, args, signal);
+				} catch (e) {
+					if (!/unexpected argument '--limit'/.test((e as Error).message)) throw e;
+					out = await runCli(backend.bin, ["map", params.url, "-f", "json"], signal);
+				}
+				links = normalizeMap(parseJson(out, "web_map"));
+			}
+			links = links.slice(0, limit);
+
+			if (links.length === 0) {
+				return {
+					content: [{ type: "text", text: `No URLs discovered for: ${params.url}` }],
+					details: { url: params.url, links },
+				};
+			}
+			return {
+				content: [{ type: "text", text: links.join("\n") }],
+				details: { url: params.url, links },
+			};
+		},
+	});
+
+	const where =
+		backend.kind === "http"
+			? `http ${backend.url}${backend.key ? "" : " (no CRW_API_KEY yet)"}`
+			: `cli ${backend.bin}`;
+	console.error(`[crw] web_search + web_scrape + web_map registered (backend: ${where})`);
 }
